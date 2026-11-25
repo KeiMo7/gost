@@ -24,6 +24,8 @@ import (
 	xplugin "github.com/go-gost/x/plugin"
 	"github.com/go-gost/x/registry"
 	"github.com/judwhite/go-svc"
+
+	"github.com/go-gost/gost/internal/topology"
 )
 
 type program struct {
@@ -35,7 +37,7 @@ type program struct {
 }
 
 func (p *program) Init(env svc.Environment) error {
-	parser.Init(parser.Args{
+	args := parser.Args{
 		CfgFiles:    cfgFiles,
 		Services:    services,
 		Nodes:       nodes,
@@ -43,13 +45,30 @@ func (p *program) Init(env svc.Environment) error {
 		Trace:       trace,
 		ApiAddr:     apiAddr,
 		MetricsAddr: metricsAddr,
-	})
+	}
+
+	// When the new grouped "-F a|b" syntax is used, the redundant-chain
+	// topology manager owns the chain. The grouped -F values must not reach
+	// the legacy x cmd builder (which would misread "|" as part of a URL), so
+	// they are withheld from the parser and wired after loader.Load.
+	if grouped, _ := topology.IsGroupedCLI(nodes); grouped {
+		args.Nodes = nil
+	}
+
+	parser.Init(args)
 
 	return nil
 }
 
 func (p *program) Start() error {
 	cfg, err := parser.Parse()
+	if err != nil {
+		return err
+	}
+
+	// Inject the placeholder chain binding for grouped declarations before any
+	// output or load so -O and service parsing see a consistent config.
+	grouped, err := prepareGroupedChain(cfg, nodes)
 	if err != nil {
 		return err
 	}
@@ -69,8 +88,26 @@ func (p *program) Start() error {
 		xmetrics.Enable(true)
 	}
 
-	if err := loader.Load(cfg); err != nil {
+	// Build the redundant topology state (isolation, counters, probes) before
+	// loader.Load. The registry entry itself is (re)published afterwards: the
+	// loader clears the chain registry while building services, and the
+	// services hold a name-based wrapper that resolves chain-0 lazily at
+	// request time, so a post-load registration is what they actually observe.
+	if grouped {
+		if _, err := applyTopologyState(nodes); err != nil {
+			return err
+		}
+	}
+
+	if err := loadConfig(cfg); err != nil {
 		return err
+	}
+
+	// Re-publish chain-0 after the loader's registry reset.
+	if grouped {
+		if err := publishTopology(); err != nil {
+			return err
+		}
 	}
 
 	if err := p.run(cfg); err != nil {
@@ -235,10 +272,35 @@ func (p *program) reloadConfig() error {
 	if err != nil {
 		return err
 	}
+
+	grouped, err := prepareGroupedChain(cfg, nodes)
+	if err != nil {
+		return err
+	}
+
+	// Build topology state first (preserves isolation/counters). On failure
+	// the previous snapshot keeps serving and we leave the loader untouched.
+	wasActive := topologyManager != nil && topologyManager.Active()
+	if grouped || wasActive {
+		if _, err := applyTopologyState(nodes); err != nil {
+			return err
+		}
+	}
+
 	config.Set(cfg)
 
-	if err := loader.Load(cfg); err != nil {
+	if err := loadConfig(cfg); err != nil {
 		return err
+	}
+
+	// Re-publish after the loader's registry reset.
+	if grouped {
+		if err := publishTopology(); err != nil {
+			return err
+		}
+	} else if wasActive {
+		// Grouped syntax removed: clear the stale entry.
+		registry.ChainRegistry().Unregister(managedChainName)
 	}
 
 	if err := p.run(cfg); err != nil {
@@ -246,6 +308,28 @@ func (p *program) reloadConfig() error {
 	}
 
 	return nil
+}
+
+// loadConfig loads cfg while hiding the topology placeholder chain from the
+// standard loader. The Manager owns chain-0's registry entry; without this
+// filter the loader would build an empty chain and fail registering the
+// duplicate name.
+func loadConfig(cfg *config.Config) error {
+	if cfg == nil {
+		return loader.Load(cfg)
+	}
+	original := cfg.Chains
+	filtered := make([]*config.ChainConfig, 0, len(original))
+	for _, ch := range original {
+		if shouldSkipChain(ch) {
+			continue
+		}
+		filtered = append(filtered, ch)
+	}
+	cfg.Chains = filtered
+	err := loader.Load(cfg)
+	cfg.Chains = original
+	return err
 }
 
 func buildApiService(cfg *config.APIConfig) (service.Service, error) {
